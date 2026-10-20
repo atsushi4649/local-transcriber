@@ -107,20 +107,15 @@
         <label>文字起こしモデル
           <select id="asrModel">
             <option value="base-ja">Moonshine Base 日本語（約100MB・高精度）</option>
-            <option value="tiny-ja">Moonshine Tiny 日本語（約35MB・軽量）</option>
           </select>
         </label>
         <label>要約モデル
           <select id="llmModel">
-            <option value="qwen3-0.6b">Qwen3 0.6B（約0.6GB・速い）</option>
-            <option value="gemma3-1b">Gemma 3 1B（約0.8GB・試験的）</option>
-            <option value="lfm2-1.2b">LFM2 1.2B（約0.8GB・試験的）</option>
-          </select>
-        </label>
-        <label>要約の処理
-          <select id="llmDevice">
-            <option value="auto">GPU（速い）</option>
-            <option value="cpu">CPU（GPUで文字化けする場合）</option>
+            <option value="qwen3.5-2b">Qwen3.5 2B（約1.5GB・おすすめ）</option>
+            <option value="gemma2-2b-jpn">Gemma 2 2B 日本語版（約1.5GB）</option>
+            <option value="qwen3.5-4b">Qwen3.5 4B（約2.5GB・高品質・メモリ多め）</option>
+            <option value="qwen3.5-0.8b">Qwen3.5 0.8B（約0.6GB・軽量）</option>
+            <option value="qwen3-0.6b-cpu">Qwen3 0.6B（CPU・GPUが使えない端末用）</option>
           </select>
         </label>
         <button id="preload">選んだモデルを今すぐダウンロード</button>
@@ -192,9 +187,10 @@ worker.onmessage = ({ data: m }) => {
   switch (m.type) {
     case 'ready':
       $('env').textContent = `文字起こし: CPU ${crossOriginIsolated ? 'マルチスレッド' : 'シングルスレッド'} / 要約: `
-        + (m.device === 'webgpu' ? `GPU (WebGPU${m.f16 ? ', f16' : ''})` : 'CPU');
+        + (m.device === 'webgpu' ? 'GPU (WebGPU)' : 'CPU のみ（GPU 非対応）');
       $('recBtn').disabled = false; $('sumBtn').disabled = false;
       setStatus('準備完了');
+      if (m.device !== 'webgpu') $('llmModel').value = 'qwen3-0.6b-cpu';
       break;
     case 'status': setStatus(m.text); break;
     case 'progress': showProgress(m); break;
@@ -202,7 +198,11 @@ worker.onmessage = ({ data: m }) => {
       appendTranscript(m.text);
       break;
     case 'summary-reset': summaryBuf = ''; $('summary').textContent = ''; break;
-    case 'summary-token': summaryBuf += m.text; $('summary').textContent = summaryBuf; break;
+    case 'summary-token': summaryBuf = m.text; $('summary').textContent = summaryBuf; break;
+    case 'llm-progress':
+      $('prog').hidden = m.progress >= 1; $('prog').value = m.progress;
+      if (m.progress < 1) setStatus(`要約モデルを準備中… ${Math.round(m.progress * 100)}%（初回のみダウンロード）`);
+      break;
     case 'summary-done':
       $('summary').textContent = m.text; $('sumBtn').disabled = false;
       setStatus('要約完了'); saveHistory(); break;
@@ -356,10 +356,10 @@ $('sumBtn').onclick = () => {
   const text = $('transcript').value.trim();
   if (!text) { setStatus('先に文字起こしをしてください', true); return; }
   $('sumBtn').disabled = true;
-  worker.postMessage({ type: 'summarize', text, llmModel: $('llmModel').value, llmDevice: $('llmDevice').value, style: $('style').value });
+  worker.postMessage({ type: 'summarize', text, llmModel: $('llmModel').value, style: $('style').value });
 };
 $('preload').onclick = () => {
-  worker.postMessage({ type: 'preload', asrModel: $('asrModel').value, llmModel: $('llmModel').value, llmDevice: $('llmDevice').value });
+  worker.postMessage({ type: 'preload', asrModel: $('asrModel').value, llmModel: $('llmModel').value });
 };
 
 // ---------- コピー・保存 ----------
@@ -406,7 +406,7 @@ function renderHist() {
 renderHist();
 
 // 設定を記憶（この端末のみ）
-for (const id of ['asrModel', 'llmModel', 'llmDevice', 'style']) {
+for (const id of ['asrModel', 'llmModel', 'style']) {
   try { const v = localStorage.getItem('opt-' + id); if (v && [...$(id).options].some((o) => o.value === v)) $(id).value = v; } catch { /* 無視 */ }
   $(id).addEventListener('change', () => { try { localStorage.setItem('opt-' + id, $(id).value); } catch { /* 無視 */ } });
 }

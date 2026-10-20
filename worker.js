@@ -8,13 +8,15 @@ env.useBrowserCache = true; // モデルは Cache Storage に保存され、2回
 
 const ASR_MODELS = {
   'base-ja': 'onnx-community/moonshine-base-ja-ONNX',
-  'tiny-ja': 'onnx-community/moonshine-tiny-ja-ONNX',
+  // tiny-ja は decoder_model_merged が無く transformers.js 3.8.1 で読み込めないため除外
 };
-// ext: 重みが .onnx_data に分かれている形式（use_external_data_format が必要）
+// 要約モデル。webllm: GPU 専用（WebLLM）、tjs: CPU でも動く（transformers.js）
 const LLM_MODELS = {
-  'qwen3-0.6b': { id: 'onnx-community/Qwen3-0.6B-ONNX' },
-  'gemma3-1b': { id: 'onnx-community/gemma-3-1b-it-ONNX', ext: true },
-  'lfm2-1.2b': { id: 'onnx-community/LFM2-1.2B-ONNX', ext: true },
+  'qwen3.5-2b': { engine: 'webllm', id: 'Qwen3.5-2B-q4f16_1-MLC' },
+  'gemma2-2b-jpn': { engine: 'webllm', id: 'gemma-2-2b-jpn-it-q4f16_1-MLC', noSystem: true },
+  'qwen3.5-4b': { engine: 'webllm', id: 'Qwen3.5-4B-q4f16_1-MLC' },
+  'qwen3.5-0.8b': { engine: 'webllm', id: 'Qwen3.5-0.8B-q4f16_1-MLC' },
+  'qwen3-0.6b-cpu': { engine: 'tjs', id: 'onnx-community/Qwen3-0.6B-ONNX' },
 };
 
 let device = 'wasm';
@@ -42,6 +44,7 @@ function progress(kind) {
 function post(msg) { self.postMessage(msg); }
 
 async function loadAsr(key) {
+  if (!ASR_MODELS[key]) key = 'base-ja';
   if (asr && asrKey === key) return asr;
   if (asr) { await asr.dispose?.(); asr = null; }
   post({ type: 'status', text: '文字起こしモデルを読み込み中…' });
@@ -59,23 +62,87 @@ async function loadAsr(key) {
   return asr;
 }
 
-async function loadLlm(name, dev) {
-  const useGpu = dev !== 'cpu' && device === 'webgpu';
-  const key = name + (useGpu ? '@gpu' : '@cpu');
-  if (llm && llmKey === key) return llm;
-  if (llm) { await llm.model.dispose?.(); llm = null; }
-  post({ type: 'status', text: '要約モデルを読み込み中…（初回は数百MB〜1GB超のダウンロード）' });
-  const { id, ext } = LLM_MODELS[name];
-  const tokenizer = await AutoTokenizer.from_pretrained(id, { progress_callback: progress('llm') });
-  const model = await AutoModelForCausalLM.from_pretrained(id, {
-    device: useGpu ? 'webgpu' : 'wasm',
-    dtype: useGpu ? (f16 ? 'q4f16' : 'q4') : (ext ? 'q4' : 'int8'),
-    ...(ext ? { use_external_data_format: true } : {}),
-    progress_callback: progress('llm'),
-  });
-  llm = { tokenizer, model };
-  llmKey = key;
+async function unloadLlm() {
+  if (!llm) return;
+  try { await llm.unload(); } catch (e) { console.warn(e); }
+  llm = null; llmKey = null;
+}
+
+async function loadLlm(name) {
+  if (llm && llmKey === name) return llm;
+  const conf = LLM_MODELS[name] || LLM_MODELS['qwen3.5-2b'];
+  if (conf.engine === 'webllm' && device !== 'webgpu') {
+    throw new Error('この端末では GPU（WebGPU）が使えないため、このモデルは動きません。設定で「Qwen3 0.6B（CPU）」を選んでください。');
+  }
+  await unloadLlm(); // 切り替え時は前のモデルを必ず解放する（メモリ不足エラー対策）
+  post({ type: 'status', text: '要約モデルを読み込み中…（初回は1〜2GB 程度のダウンロード）' });
+  llm = conf.engine === 'webllm' ? await loadWebLlm(conf) : await loadTjsLlm(conf);
+  llmKey = name;
   return llm;
+}
+
+let webllmEngine = null;
+async function loadWebLlm(conf) {
+  const webllm = await import('https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.85/+esm');
+  const onProgress = (r) => post({ type: 'llm-progress', progress: r.progress, text: r.text });
+  if (!webllmEngine) {
+    webllmEngine = await webllm.CreateMLCEngine(conf.id, { initProgressCallback: onProgress });
+  } else {
+    webllmEngine.setInitProgressCallback(onProgress);
+    await webllmEngine.reload(conf.id);
+  }
+  post({ type: 'llm-progress', progress: 1 });
+  const engine = webllmEngine;
+  return {
+    async chat(messages, onToken) {
+      if (conf.noSystem) messages = mergeSystem(messages);
+      const stream = await engine.chat.completions.create({
+        messages, stream: true, temperature: 0.2, top_p: 0.9, max_tokens: 900,
+        frequency_penalty: 0.3, extra_body: { enable_thinking: false },
+      });
+      let text = '';
+      for await (const chunk of stream) {
+        const t = chunk.choices[0]?.delta?.content || '';
+        if (t) { text += t; onToken?.(stripThink(text), true); }
+      }
+      return stripThink(text);
+    },
+    async unload() { await engine.unload(); },
+  };
+}
+
+async function loadTjsLlm(conf) {
+  const tokenizer = await AutoTokenizer.from_pretrained(conf.id, { progress_callback: progress('llm') });
+  const model = await AutoModelForCausalLM.from_pretrained(conf.id, {
+    device: 'wasm', dtype: 'int8', progress_callback: progress('llm'),
+  });
+  return {
+    async chat(messages, onToken) {
+      const inputs = tokenizer.apply_chat_template(messages, {
+        add_generation_prompt: true, return_dict: true, enable_thinking: false,
+      });
+      let text = '';
+      const streamer = new TextStreamer(tokenizer, {
+        skip_prompt: true, skip_special_tokens: true,
+        callback_function: (t) => { text += t; onToken?.(stripThink(text), true); },
+      });
+      await model.generate({ ...inputs, max_new_tokens: 900, do_sample: false, repetition_penalty: 1.1, streamer });
+      return stripThink(text);
+    },
+    async unload() { await model.dispose(); },
+  };
+}
+
+// system ロール非対応のモデル（Gemma）向けに、指示を最初の user メッセージへまとめる
+function mergeSystem(messages) {
+  const sys = messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
+  const rest = messages.filter((m) => m.role !== 'system');
+  if (sys && rest[0]) rest[0] = { ...rest[0], content: sys + '\n\n' + rest[0].content };
+  return rest;
+}
+
+function stripThink(t) {
+  return t.replace(/<think>[\s\S]*?(<\/think>|$)/g, '').trimStart();
 }
 
 async function transcribe({ id, audio, asrModel }) {
@@ -95,25 +162,8 @@ function cleanup(t) {
   return t.replace(/(.{2,20}?)\1{3,}/g, '$1');
 }
 
-async function generate({ tokenizer, model }, messages, onToken) {
-  const inputs = tokenizer.apply_chat_template(messages, {
-    add_generation_prompt: true, return_dict: true, enable_thinking: false,
-  });
-  let inThink = false;
-  const streamer = new TextStreamer(tokenizer, {
-    skip_prompt: true, skip_special_tokens: true,
-    callback_function: (t) => {
-      if (t.includes('<think>')) inThink = true;
-      if (!inThink) onToken?.(t);
-      if (t.includes('</think>')) inThink = false;
-    },
-  });
-  const out = await model.generate({
-    ...inputs, max_new_tokens: 900, do_sample: false, repetition_penalty: 1.1, streamer,
-  });
-  const len = inputs.input_ids.dims[1];
-  const text = tokenizer.batch_decode(out.slice(null, [len, null]), { skip_special_tokens: true })[0];
-  return text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+async function generate(m, messages, onToken) {
+  return (await m.chat(messages, onToken)).trim();
 }
 
 const SYS = 'あなたは日本語の文字起こしを要約するアシスタントです。文字起こしには誤認識が含まれることがあるので、文脈から自然に補って理解してください。事実を付け加えず、内容に忠実に、簡潔な日本語で書いてください。予定や決定事項の時制（〜する予定、〜までに行う等）は元の発言のまま保ってください。';
@@ -129,10 +179,10 @@ function splitText(text, size = 2200) {
   return parts;
 }
 
-async function summarize({ text, llmModel, llmDevice, style }) {
-  const m = await loadLlm(llmModel, llmDevice);
+async function summarize({ text, llmModel, style }) {
+  const m = await loadLlm(llmModel);
   const format = style === 'minutes'
-    ? '次の形式で出力してください。\n## 概要\n（2〜3文）\n## 要点\n- …\n## 決定事項・TODO\n- …（なければ「なし」）'
+    ? '次の形式で出力してください。\n## 概要\n（2〜3文）\n## 要点\n- …\n## 決定事項・TODO\n- 担当者：やること（期限）\n\n「決定事項・TODO」には、文字起こしに出てきた担当・期限・日程をすべて、上の1行の形で具体的に書いてください。担当者が不明なら「担当未定」と書いてください。'
     : '次の形式で出力してください。\n## 概要\n（2〜3文）\n## 要点\n- …（3〜7個）';
 
   let source = text;
@@ -170,7 +220,7 @@ self.onmessage = (e) => {
       else if (msg.type === 'summarize') await summarize(msg);
       else if (msg.type === 'preload') {
         await loadAsr(msg.asrModel);
-        await loadLlm(msg.llmModel, msg.llmDevice);
+        await loadLlm(msg.llmModel);
         post({ type: 'preloaded' });
       }
       post({ type: 'idle', for: msg.type, id: msg.id });
