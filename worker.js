@@ -24,14 +24,22 @@ let f16 = false;
 let asr = null, asrKey = null;
 let llm = null, llmKey = null;
 
+// WebGPU が使えるか調べる。使えない理由も診断表示用に返す。
 async function detectDevice() {
+  let gpuDiag;
   try {
-    if (navigator.gpu) {
+    if (!navigator.gpu) gpuDiag = 'navigator.gpu なし（ワーカー内で WebGPU が無効）';
+    else {
       const adapter = await navigator.gpu.requestAdapter();
-      if (adapter) { device = 'webgpu'; f16 = adapter.features.has('shader-f16'); }
+      if (!adapter) gpuDiag = 'requestAdapter() が null（ブラウザが GPU を許可していない）';
+      else {
+        device = 'webgpu'; f16 = adapter.features.has('shader-f16');
+        const i = adapter.info || {};
+        gpuDiag = `OK: ${i.vendor || '?'} ${i.architecture || ''} ${i.description || ''}`.trim();
+      }
     }
-  } catch { /* WASM にフォールバック */ }
-  return { device, f16 };
+  } catch (e) { gpuDiag = 'エラー: ' + (e?.message || e); }
+  return { device, f16, gpuDiag };
 }
 
 function progress(kind) {

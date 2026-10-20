@@ -121,6 +121,11 @@
         <button id="preload">選んだモデルを今すぐダウンロード</button>
       </div>
       <p class="small" id="storage"></p>
+      <details style="margin-top:8px">
+        <summary>診断情報（GPU が使えないとき）</summary>
+        <pre id="diag" class="small" style="white-space:pre-wrap;margin:8px 0"></pre>
+        <button id="copyDiag">診断情報をコピー</button>
+      </details>
       <p class="small">処理はすべてこの端末の中で行われ、音声や文字は外部に送信されません。
         初回だけモデルをダウンロードし、以降は機内モードでも動きます。</p>
     </details>
@@ -163,6 +168,27 @@ if ('serviceWorker' in navigator) {
   }).catch(() => {});
 }
 
+// ---------- 診断（WebGPU が使えない原因を調べる） ----------
+async function runDiag(workerGpu) {
+  let mainGpu;
+  try {
+    if (!navigator.gpu) mainGpu = 'navigator.gpu なし';
+    else {
+      const a = await navigator.gpu.requestAdapter();
+      mainGpu = a ? `OK: ${a.info?.vendor || '?'} ${a.info?.architecture || ''}`.trim() : 'requestAdapter() が null';
+    }
+  } catch (e) { mainGpu = 'エラー: ' + (e?.message || e); }
+  $('diag').textContent = [
+    `ブラウザ: ${navigator.userAgent}`,
+    `HTTPS など安全な接続: ${isSecureContext ? 'はい' : 'いいえ'}`,
+    `マルチスレッド (crossOriginIsolated): ${crossOriginIsolated ? 'はい' : 'いいえ'}`,
+    `CPU コア数: ${navigator.hardwareConcurrency || '?'} / メモリ: ${navigator.deviceMemory || '?'}GB 以上`,
+    `WebGPU（画面側）: ${mainGpu}`,
+    `WebGPU（処理側ワーカー）: ${workerGpu || '?'}`,
+  ].join('\n');
+}
+$('copyDiag').onclick = () => copy($('diag').textContent);
+
 // ---------- 状態表示 ----------
 function setStatus(text, err = false) { $('status').textContent = text; $('status').classList.toggle('err', err); }
 const files = new Map();
@@ -191,6 +217,7 @@ worker.onmessage = ({ data: m }) => {
       $('recBtn').disabled = false; $('sumBtn').disabled = false;
       setStatus('準備完了');
       if (m.device !== 'webgpu') $('llmModel').value = 'qwen3-0.6b-cpu';
+      runDiag(m.gpuDiag);
       break;
     case 'status': setStatus(m.text); break;
     case 'progress': showProgress(m); break;

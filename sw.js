@@ -1,6 +1,6 @@
 // ページ本体とライブラリをキャッシュし、オフラインでも起動できるようにする。
 // （モデル本体は transformers.js が別のキャッシュに保存する）
-const CACHE = 'app-v4';
+const CACHE = 'app-v5';
 const CORE = ['./', 'index.html', 'worker.js', 'recorder-worklet.js', 'manifest.webmanifest', 'icon.svg'];
 
 self.addEventListener('install', (e) => {
