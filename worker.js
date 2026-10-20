@@ -1,6 +1,6 @@
 // 推論はすべてこのワーカー内（端末上）で実行する。音声・テキストは外部に送信しない。
 import {
-  pipeline, AutoTokenizer, AutoModelForCausalLM, TextStreamer, env,
+  pipeline, AutoTokenizer, AutoModelForCausalLM, TextStreamer, InterruptableStoppingCriteria, env,
 } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
 
 env.allowLocalModels = false;
@@ -97,15 +97,21 @@ async function loadWebLlm(conf) {
     async chat(messages, onToken) {
       if (conf.noSystem) messages = mergeSystem(messages);
       const stream = await engine.chat.completions.create({
-        messages, stream: true, temperature: 0.2, top_p: 0.9, max_tokens: 900,
-        frequency_penalty: 0.3, extra_body: { enable_thinking: false },
+        messages, stream: true, temperature: 0.3, top_p: 0.9, max_tokens: 700,
+        repetition_penalty: 1.1, frequency_penalty: 0.4, extra_body: { enable_thinking: false },
       });
       let text = '';
-      for await (const chunk of stream) {
-        const t = chunk.choices[0]?.delta?.content || '';
-        if (t) { text += t; onToken?.(stripThink(text), true); }
-      }
-      return stripThink(text);
+      interrupt = () => engine.interruptGenerate();
+      try {
+        for await (const chunk of stream) {
+          const t = chunk.choices[0]?.delta?.content || '';
+          if (!t) continue;
+          text += t;
+          if (looping(text)) { engine.interruptGenerate(); break; }
+          onToken?.(clean(text));
+        }
+      } finally { interrupt = null; }
+      return clean(text);
     },
     async unload() { await engine.unload(); },
   };
@@ -121,13 +127,23 @@ async function loadTjsLlm(conf) {
       const inputs = tokenizer.apply_chat_template(messages, {
         add_generation_prompt: true, return_dict: true, enable_thinking: false,
       });
+      const stopper = new InterruptableStoppingCriteria();
+      interrupt = () => stopper.interrupt();
       let text = '';
       const streamer = new TextStreamer(tokenizer, {
         skip_prompt: true, skip_special_tokens: true,
-        callback_function: (t) => { text += t; onToken?.(stripThink(text), true); },
+        callback_function: (t) => {
+          text += t;
+          if (looping(text)) stopper.interrupt(); else onToken?.(clean(text));
+        },
       });
-      await model.generate({ ...inputs, max_new_tokens: 900, do_sample: false, repetition_penalty: 1.1, streamer });
-      return stripThink(text);
+      try {
+        await model.generate({
+          ...inputs, max_new_tokens: 700, do_sample: false, repetition_penalty: 1.15,
+          streamer, stopping_criteria: stopper,
+        });
+      } finally { interrupt = null; }
+      return clean(text);
     },
     async unload() { await model.dispose(); },
   };
@@ -143,6 +159,38 @@ function mergeSystem(messages) {
 
 function stripThink(t) {
   return t.replace(/<think>[\s\S]*?(<\/think>|$)/g, '').trimStart();
+}
+
+// 生成中の現在のモデルを止める関数（停止ボタン・繰り返し検知用）
+let interrupt = null;
+
+// 小さいモデルが同じ行や同じフレーズを繰り返し始めたら true
+function looping(text) {
+  const lines = text.split('\n').map((l) => l.trim()).filter((l) => l.length >= 4);
+  const count = new Map();
+  for (const l of lines) {
+    const n = (count.get(l) || 0) + 1;
+    if (n >= 3) return true;
+    count.set(l, n);
+  }
+  const tail = text.slice(-300);
+  for (let len = 6; len <= 100; len++) {
+    const x = tail.slice(-len);
+    if (x.trim() && tail.endsWith(x + x + x)) return true;
+  }
+  return false;
+}
+
+// 思考タグを除き、同じ行の2回目以降を消す（空行は残す）
+function clean(text) {
+  const seen = new Set();
+  return stripThink(text).split('\n').filter((l) => {
+    const k = l.trim();
+    if (!k) return true;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  }).join('\n').trim();
 }
 
 async function transcribe({ id, audio, asrModel }) {
@@ -166,7 +214,7 @@ async function generate(m, messages, onToken) {
   return (await m.chat(messages, onToken)).trim();
 }
 
-const SYS = 'あなたは日本語の文字起こしを要約するアシスタントです。文字起こしには誤認識が含まれることがあるので、文脈から自然に補って理解してください。事実を付け加えず、内容に忠実に、簡潔な日本語で書いてください。予定や決定事項の時制（〜する予定、〜までに行う等）は元の発言のまま保ってください。';
+const SYS = 'あなたは日本語の文字起こしを要約するアシスタントです。文字起こしには誤認識が含まれることがあるので、文脈から自然に補って理解してください。事実を付け加えず、内容に忠実に、簡潔な日本語で書いてください。これからの予定を過去のこととして書かないでください。';
 
 function splitText(text, size = 2200) {
   const parts = [];
@@ -180,39 +228,43 @@ function splitText(text, size = 2200) {
 }
 
 async function summarize({ text, llmModel, style }) {
+  stopRequested = false;
   const m = await loadLlm(llmModel);
   const format = style === 'minutes'
-    ? '次の形式で出力してください。\n## 概要\n（2〜3文）\n## 要点\n- …\n## 決定事項・TODO\n- 担当者：やること（期限）\n\n「決定事項・TODO」には、文字起こしに出てきた担当・期限・日程をすべて、上の1行の形で具体的に書いてください。担当者が不明なら「担当未定」と書いてください。'
-    : '次の形式で出力してください。\n## 概要\n（2〜3文）\n## 要点\n- …（3〜7個）';
+    ? '議事録としてまとめてください。見出し「## 概要」の下に全体を2〜3文の文章で、見出し「## 要点」の下に重要な内容を箇条書きで、見出し「## 決定事項・TODO」の下に、決まったことや誰が何をいつまでにするかを箇条書きで書いてください。各見出しは1回だけ使い、最後まで書いたら終えてください。'
+    : '要約してください。見出し「## 概要」の下に全体を2〜3文の文章で、見出し「## 要点」の下に重要な内容を3〜7個の箇条書きで書いてください。各見出しは1回だけ使い、最後まで書いたら終えてください。';
 
   let source = text;
   const parts = splitText(text);
   if (parts.length > 1) {
     // 長い文字起こしは分割して要点を抽出してから、最後にまとめる
     const notes = [];
-    for (let i = 0; i < parts.length; i++) {
+    for (let i = 0; i < parts.length && !stopRequested; i++) {
       post({ type: 'status', text: `長文のため分割して処理中… (${i + 1}/${parts.length})` });
       const n = await generate(m, [
         { role: 'system', content: SYS },
-        { role: 'user', content: `以下は文字起こしの一部です。重要な点を箇条書きで5個以内にまとめてください。\n\n${parts[i]}` },
+        { role: 'user', content: `【文字起こしの一部】\n${parts[i]}\n\n上の内容の重要な点を、箇条書きで5個以内にまとめてください。` },
       ]);
       notes.push(n);
     }
     source = notes.join('\n');
   }
+  if (stopRequested) { post({ type: 'summary-done', text: '', stopped: true }); return; }
   post({ type: 'status', text: '要約を生成中…' });
   post({ type: 'summary-reset' });
   const final = await generate(m, [
     { role: 'system', content: SYS },
-    { role: 'user', content: `${parts.length > 1 ? '以下は長い文字起こしから抽出した要点です。全体の' : '以下の文字起こしの'}要約を作ってください。\n${format}\n\n---\n${source}` },
+    { role: 'user', content: `【${parts.length > 1 ? '長い文字起こしから抽出したメモ' : '文字起こし'}】\n${source}\n\n上の内容を${format}` },
   ], (t) => post({ type: 'summary-token', text: t }));
-  post({ type: 'summary-done', text: final });
+  post({ type: 'summary-done', text: final, stopped: stopRequested });
 }
 
 // メッセージを1件ずつ順番に処理する
 let queue = Promise.resolve();
+let stopRequested = false;
 self.onmessage = (e) => {
   const msg = e.data;
+  if (msg.type === 'stop') { stopRequested = true; interrupt?.(); return; }
   queue = queue.then(async () => {
     try {
       if (msg.type === 'init') post({ type: 'ready', ...(await detectDevice()) });

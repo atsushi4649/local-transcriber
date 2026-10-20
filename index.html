@@ -204,8 +204,9 @@ worker.onmessage = ({ data: m }) => {
       if (m.progress < 1) setStatus(`要約モデルを準備中… ${Math.round(m.progress * 100)}%（初回のみダウンロード）`);
       break;
     case 'summary-done':
-      $('summary').textContent = m.text; $('sumBtn').disabled = false;
-      setStatus('要約完了'); saveHistory(); break;
+      if (m.text) $('summary').textContent = m.text;
+      setSummarizing(false);
+      setStatus(m.stopped ? '要約を停止しました' : '要約完了'); saveHistory(); break;
     case 'preloaded': setStatus('モデルの準備完了。以降はオフラインで使えます。'); storageInfo(); break;
     case 'idle':
       if (m.for === 'transcribe') {
@@ -217,7 +218,7 @@ worker.onmessage = ({ data: m }) => {
     case 'error':
       setStatus('エラー: ' + m.text, true);
       if (m.for === 'transcribe') pending--;
-      if (m.for === 'summarize') $('sumBtn').disabled = false;
+      if (m.for === 'summarize') setSummarizing(false);
       break;
   }
 };
@@ -352,10 +353,17 @@ $('file').onchange = (e) => { const f = e.target.files[0]; if (f) processFile(f)
 window.processFile = processFile; // テスト用
 
 // ---------- 要約 ----------
+let summarizing = false;
+function setSummarizing(on) {
+  summarizing = on;
+  $('sumBtn').textContent = on ? '■ 停止' : '要約する';
+  $('sumBtn').className = on ? 'rec' : 'primary';
+}
 $('sumBtn').onclick = () => {
+  if (summarizing) { worker.postMessage({ type: 'stop' }); setStatus('停止しています…'); return; }
   const text = $('transcript').value.trim();
   if (!text) { setStatus('先に文字起こしをしてください', true); return; }
-  $('sumBtn').disabled = true;
+  setSummarizing(true);
   worker.postMessage({ type: 'summarize', text, llmModel: $('llmModel').value, style: $('style').value });
 };
 $('preload').onclick = () => {
