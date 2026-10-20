@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ローカル文字起こし</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#1f2a37">
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1c2430; --muted: #6b7686; --line: #e2e6ec;
+    --accent: #2563eb; --accent-text: #fff; --rec: #dc2626; --ok: #15803d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #11161d; --card: #1a212b; --text: #e6ebf1; --muted: #93a0b0; --line: #2b3542;
+      --accent: #3b82f6; --rec: #ef4444; --ok: #22c55e; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.6 system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  main { max-width: 960px; margin: 0 auto; padding: 16px; display: grid; gap: 14px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+  h1 { font-size: 1.25rem; margin: 0; }
+  .badge { font-size: .8rem; color: var(--muted); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  label { font-size: .85rem; color: var(--muted); display: grid; gap: 4px; }
+  select, button, textarea { font: inherit; color: inherit; }
+  select { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
+  button { border: 1px solid var(--line); background: var(--bg); border-radius: 10px; padding: 10px 16px;
+    cursor: pointer; min-height: 44px; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  button.rec { background: var(--rec); color: #fff; border-color: var(--rec); }
+  button:disabled { opacity: .5; cursor: default; }
+  .big { font-size: 1.1rem; padding: 14px 22px; }
+  textarea { width: 100%; min-height: 220px; background: var(--bg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px; resize: vertical; }
+  h2 { font-size: 1rem; margin: 0 0 8px; display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+  #status { font-size: .9rem; color: var(--muted); min-height: 1.4em; }
+  #status.err { color: var(--rec); }
+  progress { width: 100%; height: 8px; }
+  .summary { white-space: pre-wrap; min-height: 80px; background: var(--bg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px; }
+  .timer { font-variant-numeric: tabular-nums; font-size: 1.1rem; }
+  .level { width: 120px; height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; }
+  .level > div { height: 100%; width: 0; background: var(--ok); transition: width .1s; }
+  .small { font-size: .8rem; color: var(--muted); }
+  details summary { cursor: pointer; color: var(--muted); }
+  #history li { margin: 4px 0; }
+  #history button { min-height: 32px; padding: 4px 10px; font-size: .85rem; }
+  .grid2 { display: grid; gap: 14px; grid-template-columns: 1fr; }
+  @media (min-width: 820px) { .grid2 { grid-template-columns: 1fr 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>ローカル文字起こし</h1>
+    <span class="badge" id="env">準備中…</span>
+  </header>
+
+  <section class="card">
+    <div class="row">
+      <button id="recBtn" class="primary big" disabled>● 録音開始</button>
+      <span class="timer" id="timer">00:00</span>
+      <div class="level"><div id="level"></div></div>
+      <label style="margin-left:auto">音声ファイル
+        <input type="file" id="file" accept="audio/*,video/*">
+      </label>
+    </div>
+    <div id="status" style="margin-top:10px"></div>
+    <progress id="prog" max="1" value="0" hidden></progress>
+  </section>
+
+  <div class="grid2">
+    <section class="card">
+      <h2>文字起こし
+        <span class="row">
+          <button id="copyT">コピー</button>
+          <button id="saveT">保存</button>
+          <button id="clearT">クリア</button>
+        </span>
+      </h2>
+      <textarea id="transcript" placeholder="録音するか音声ファイルを選ぶと、ここに文字が入ります（編集できます）"></textarea>
+    </section>
+
+    <section class="card">
+      <h2>要約
+        <span class="row">
+          <select id="style">
+            <option value="summary">要点まとめ</option>
+            <option value="minutes">議事録風</option>
+          </select>
+          <button id="sumBtn" class="primary" disabled>要約する</button>
+          <button id="copyS">コピー</button>
+        </span>
+      </h2>
+      <div class="summary" id="summary"></div>
+    </section>
+  </div>
+
+  <section class="card">
+    <details>
+      <summary>設定・オフライン準備</summary>
+      <div class="row" style="margin-top:10px">
+        <label>文字起こしモデル
+          <select id="asrModel">
+            <option value="base-ja">Moonshine Base 日本語（約100MB・高精度）</option>
+            <option value="tiny-ja">Moonshine Tiny 日本語（約35MB・軽量）</option>
+          </select>
+        </label>
+        <label>要約モデル
+          <select id="llmModel">
+            <option value="qwen3-0.6b">Qwen3 0.6B（約0.6GB・速い）</option>
+            <option value="gemma3-1b">Gemma 3 1B（約0.8GB・試験的）</option>
+            <option value="lfm2-1.2b">LFM2 1.2B（約0.8GB・試験的）</option>
+          </select>
+        </label>
+        <label>要約の処理
+          <select id="llmDevice">
+            <option value="auto">GPU（速い）</option>
+            <option value="cpu">CPU（GPUで文字化けする場合）</option>
+          </select>
+        </label>
+        <button id="preload">選んだモデルを今すぐダウンロード</button>
+      </div>
+      <p class="small" id="storage"></p>
+      <p class="small">処理はすべてこの端末の中で行われ、音声や文字は外部に送信されません。
+        初回だけモデルをダウンロードし、以降は機内モードでも動きます。</p>
+    </details>
+  </section>
+
+  <section class="card">
+    <details>
+      <summary>履歴（この端末にのみ保存）</summary>
+      <ul id="history"></ul>
+    </details>
+  </section>
+</main>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const SR = 16000;
+const worker = new Worker('worker.js', { type: 'module' });
+
+// ---------- 永続ストレージ（モデルが勝手に消されにくくする） ----------
+async function storageInfo() {
+  try {
+    const persisted = await navigator.storage?.persist?.();
+    const est = await navigator.storage?.estimate?.();
+    const gb = (n) => (n / 1e9).toFixed(2) + 'GB';
+    $('storage').textContent = `保存領域: 使用 ${est ? gb(est.usage) : '?'} / 上限 ${est ? gb(est.quota) : '?'}・`
+      + (persisted ? '永続化オン（自動削除されにくい）' : '永続化オフ（容量不足時に削除される可能性あり）');
+  } catch { /* 非対応ブラウザ */ }
+}
+storageInfo();
+// Service Worker 経由で COOP/COEP を付けるため、初回は登録後に一度だけ再読み込みする
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').then(async () => {
+    await navigator.serviceWorker.ready;
+    let reloaded = false;
+    try { reloaded = sessionStorage.getItem('coi-reload') === '1'; } catch { /* 無視 */ }
+    if (!crossOriginIsolated && !reloaded) {
+      try { sessionStorage.setItem('coi-reload', '1'); } catch { /* 無視 */ }
+      location.reload();
+    }
+  }).catch(() => {});
+}
+
+// ---------- 状態表示 ----------
+function setStatus(text, err = false) { $('status').textContent = text; $('status').classList.toggle('err', err); }
+const files = new Map();
+function showProgress(m) {
+  if (m.done) files.delete(m.file); else files.set(m.file, m);
+  let loaded = 0, total = 0;
+  for (const f of files.values()) { loaded += f.loaded || 0; total += f.total || 0; }
+  $('prog').hidden = files.size === 0;
+  if (total) {
+    $('prog').value = loaded / total;
+    setStatus(`モデルをダウンロード中… ${(loaded / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB（初回のみ）`);
+  }
+}
+
+// ---------- ワーカーとのやりとり ----------
+let pending = 0;      // 文字起こし待ちセグメント数
+let segId = 0;
+const segText = new Map();
+let summaryBuf = '';
+
+worker.onmessage = ({ data: m }) => {
+  switch (m.type) {
+    case 'ready':
+      $('env').textContent = `文字起こし: CPU ${crossOriginIsolated ? 'マルチスレッド' : 'シングルスレッド'} / 要約: `
+        + (m.device === 'webgpu' ? `GPU (WebGPU${m.f16 ? ', f16' : ''})` : 'CPU');
+      $('recBtn').disabled = false; $('sumBtn').disabled = false;
+      setStatus('準備完了');
+      break;
+    case 'status': setStatus(m.text); break;
+    case 'progress': showProgress(m); break;
+    case 'segment':
+      appendTranscript(m.text);
+      break;
+    case 'summary-reset': summaryBuf = ''; $('summary').textContent = ''; break;
+    case 'summary-token': summaryBuf += m.text; $('summary').textContent = summaryBuf; break;
+    case 'summary-done':
+      $('summary').textContent = m.text; $('sumBtn').disabled = false;
+      setStatus('要約完了'); saveHistory(); break;
+    case 'preloaded': setStatus('モデルの準備完了。以降はオフラインで使えます。'); storageInfo(); break;
+    case 'idle':
+      if (m.for === 'transcribe') {
+        pending--;
+        if (pending <= 0 && !recording) { pending = 0; setStatus('文字起こし完了'); saveHistory(); }
+        else if (pending > 0) setStatus(`文字起こし中…（残り ${pending} 区間）`);
+      }
+      break;
+    case 'error':
+      setStatus('エラー: ' + m.text, true);
+      if (m.for === 'transcribe') pending--;
+      if (m.for === 'summarize') $('sumBtn').disabled = false;
+      break;
+  }
+};
+worker.postMessage({ type: 'init' });
+
+function appendTranscript(text) {
+  if (!text) return;
+  const ta = $('transcript');
+  const atEnd = ta.scrollTop + ta.clientHeight >= ta.scrollHeight - 20;
+  ta.value += (ta.value && !ta.value.endsWith('\n') ? '\n' : '') + text;
+  if (atEnd) ta.scrollTop = ta.scrollHeight;
+}
+
+function sendSegment(samples) {
+  pending++;
+  worker.postMessage({ type: 'transcribe', id: ++segId, audio: samples, asrModel: $('asrModel').value }, [samples.buffer]);
+  setStatus(`文字起こし中…（残り ${pending} 区間）`);
+}
+
+// ---------- 無音で区切るセグメンタ ----------
+// 30ms ごとの音量を見て、3秒以上話した後の 0.4 秒の無音で区切る。最大 20 秒で強制分割。
+class Segmenter {
+  constructor(onSegment) {
+    this.onSegment = onSegment;
+    this.frame = 480; this.buf = []; this.len = 0; this.pending = new Float32Array(0);
+    this.silentRun = 0; this.voiced = 0; this.noise = 0.003; this.rmsHist = [];
+  }
+  push(chunk) {
+    let data = this.pending.length ? concat([this.pending, chunk]) : chunk;
+    let i = 0;
+    for (; i + this.frame <= data.length; i += this.frame) this.frameIn(data.subarray(i, i + this.frame));
+    this.pending = data.slice(i);
+  }
+  frameIn(f) {
+    let s = 0; for (const v of f) s += v * v;
+    const rms = Math.sqrt(s / f.length);
+    // ノイズフロアを緩やかに追従
+    this.noise = rms < this.noise ? rms * 0.1 + this.noise * 0.9 : this.noise * 0.999 + rms * 0.001;
+    const thr = Math.max(0.006, this.noise * 2.5);
+    const silent = rms < thr;
+    this.buf.push(f.slice(0)); this.rmsHist.push(rms); this.len += f.length;
+    if (silent) this.silentRun++; else { this.silentRun = 0; this.voiced++; }
+    const sec = this.len / SR;
+    if ((sec >= 3 && this.silentRun >= 13) || sec >= 20) this.cut(sec >= 20 && this.silentRun < 13);
+  }
+  cut(forced) {
+    let at = this.buf.length;
+    if (forced) { // 直近 3 秒で最も静かな位置で切る
+      let best = at - 1, min = Infinity;
+      for (let k = Math.max(0, at - 100); k < at; k++) if (this.rmsHist[k] < min) { min = this.rmsHist[k]; best = k; }
+      at = best + 1;
+    }
+    const head = this.buf.splice(0, at); this.rmsHist.splice(0, at);
+    this.len = this.buf.length * this.frame;
+    const voicedFrames = this.voiced; this.voiced = 0; this.silentRun = 0;
+    if (voicedFrames >= 10) this.onSegment(concat(head)); // 0.3 秒未満の発話は捨てる
+  }
+  flush() {
+    if (this.pending.length) { this.buf.push(this.pending); this.pending = new Float32Array(0); }
+    if (this.buf.length) { const v = this.voiced; this.voiced = 0; const all = concat(this.buf);
+      this.buf = []; this.rmsHist = []; this.len = 0; if (v >= 10) this.onSegment(all); }
+  }
+}
+function concat(arrs) {
+  const out = new Float32Array(arrs.reduce((n, a) => n + a.length, 0));
+  let o = 0; for (const a of arrs) { out.set(a, o); o += a.length; }
+  return out;
+}
+
+// ---------- 録音（話しながら逐次文字起こし） ----------
+let recording = false, ctx, stream, node, seg, startAt, tick, wakeLock;
+$('recBtn').onclick = async () => {
+  if (!recording) await startRec(); else await stopRec();
+};
+async function startRec() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: false, noiseSuppression: true, autoGainControl: true },
+    });
+  } catch (e) { setStatus('マイクを使えません: ' + e.message, true); return; }
+  ctx = new AudioContext({ sampleRate: SR });
+  await ctx.audioWorklet.addModule('recorder-worklet.js');
+  const src = ctx.createMediaStreamSource(stream);
+  node = new AudioWorkletNode(ctx, 'recorder');
+  seg = new Segmenter(sendSegment);
+  node.port.onmessage = ({ data }) => {
+    seg.push(data);
+    let s = 0; for (const v of data) s += v * v;
+    $('level').style.width = Math.min(100, Math.sqrt(s / data.length) * 400) + '%';
+  };
+  src.connect(node);
+  recording = true; startAt = Date.now();
+  $('recBtn').textContent = '■ 停止'; $('recBtn').className = 'rec big';
+  tick = setInterval(() => {
+    const t = Math.floor((Date.now() - startAt) / 1000);
+    $('timer').textContent = `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
+  }, 500);
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch { /* 任意 */ }
+  setStatus('録音中…（話した区切りごとに文字起こしされます）');
+}
+async function stopRec() {
+  recording = false;
+  clearInterval(tick);
+  node.port.onmessage = null; node.disconnect();
+  stream.getTracks().forEach((t) => t.stop());
+  await ctx.close();
+  seg.flush();
+  wakeLock?.release?.(); wakeLock = null;
+  $('level').style.width = '0';
+  $('recBtn').textContent = '● 録音開始'; $('recBtn').className = 'primary big';
+  if (pending === 0) setStatus('録音停止');
+}
+
+// ---------- 音声ファイル ----------
+async function processFile(blob) {
+  setStatus('音声を読み込み中…');
+  try {
+    const buf = await blob.arrayBuffer();
+    const ac = new AudioContext();
+    const decoded = await ac.decodeAudioData(buf);
+    await ac.close();
+    const off = new OfflineAudioContext(1, Math.ceil(decoded.duration * SR), SR);
+    const src = off.createBufferSource(); src.buffer = decoded; src.connect(off.destination); src.start();
+    const pcm = (await off.startRendering()).getChannelData(0);
+    const s = new Segmenter(sendSegment);
+    for (let i = 0; i < pcm.length; i += SR) s.push(pcm.subarray(i, i + SR));
+    s.flush();
+    if (pending === 0) setStatus('音声が検出されませんでした');
+  } catch (e) { setStatus('読み込めませんでした: ' + e.message, true); }
+}
+$('file').onchange = (e) => { const f = e.target.files[0]; if (f) processFile(f); e.target.value = ''; };
+window.processFile = processFile; // テスト用
+
+// ---------- 要約 ----------
+$('sumBtn').onclick = () => {
+  const text = $('transcript').value.trim();
+  if (!text) { setStatus('先に文字起こしをしてください', true); return; }
+  $('sumBtn').disabled = true;
+  worker.postMessage({ type: 'summarize', text, llmModel: $('llmModel').value, llmDevice: $('llmDevice').value, style: $('style').value });
+};
+$('preload').onclick = () => {
+  worker.postMessage({ type: 'preload', asrModel: $('asrModel').value, llmModel: $('llmModel').value, llmDevice: $('llmDevice').value });
+};
+
+// ---------- コピー・保存 ----------
+async function copy(text) {
+  try { await navigator.clipboard.writeText(text); setStatus('コピーしました'); }
+  catch { setStatus('コピーできませんでした', true); }
+}
+$('copyT').onclick = () => copy($('transcript').value);
+$('copyS').onclick = () => copy($('summary').textContent);
+$('clearT').onclick = () => { if (confirm('文字起こしと要約を消しますか？（履歴は残ります）')) { $('transcript').value = ''; $('summary').textContent = ''; currentId = null; } };
+$('saveT').onclick = () => {
+  const body = $('transcript').value + ($('summary').textContent ? '\n\n=== 要約 ===\n' + $('summary').textContent : '');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([body], { type: 'text/plain' }));
+  a.download = `文字起こし_${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.txt`;
+  a.click(); URL.revokeObjectURL(a.href);
+};
+
+// ---------- 履歴（localStorage・この端末のみ） ----------
+let currentId = null;
+function loadHist() { try { return JSON.parse(localStorage.getItem('history') || '[]'); } catch { return []; } }
+function saveHistory() {
+  const t = $('transcript').value.trim(); if (!t) return;
+  const h = loadHist();
+  if (!currentId) currentId = Date.now();
+  const entry = { id: currentId, date: new Date(currentId).toLocaleString('ja-JP'), transcript: t, summary: $('summary').textContent };
+  const i = h.findIndex((x) => x.id === currentId);
+  if (i >= 0) h[i] = entry; else h.unshift(entry);
+  try { localStorage.setItem('history', JSON.stringify(h.slice(0, 30))); } catch { /* 容量超過など */ }
+  renderHist();
+}
+function renderHist() {
+  const ul = $('history'); ul.textContent = '';
+  for (const e of loadHist()) {
+    const li = document.createElement('li');
+    const b = document.createElement('button'); b.textContent = '開く';
+    b.onclick = () => { $('transcript').value = e.transcript; $('summary').textContent = e.summary || ''; currentId = e.id; };
+    const d = document.createElement('button'); d.textContent = '削除';
+    d.onclick = () => { localStorage.setItem('history', JSON.stringify(loadHist().filter((x) => x.id !== e.id))); renderHist(); };
+    li.append(b, ' ', d, ` ${e.date} — ${e.transcript.slice(0, 40)}…`);
+    ul.append(li);
+  }
+}
+renderHist();
+
+// 設定を記憶（この端末のみ）
+for (const id of ['asrModel', 'llmModel', 'llmDevice', 'style']) {
+  try { const v = localStorage.getItem('opt-' + id); if (v && [...$(id).options].some((o) => o.value === v)) $(id).value = v; } catch { /* 無視 */ }
+  $(id).addEventListener('change', () => { try { localStorage.setItem('opt-' + id, $(id).value); } catch { /* 無視 */ } });
+}
+</script>
+</body>
+</html>
