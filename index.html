@@ -111,11 +111,17 @@
         </label>
         <label>要約モデル
           <select id="llmModel">
-            <option value="qwen3.5-2b">Qwen3.5 2B（約1.5GB・おすすめ）</option>
-            <option value="gemma2-2b-jpn">Gemma 2 2B 日本語版（約1.5GB）</option>
-            <option value="qwen3.5-4b">Qwen3.5 4B（約2.5GB・高品質・メモリ多め）</option>
-            <option value="qwen3.5-0.8b">Qwen3.5 0.8B（約0.6GB・軽量）</option>
-            <option value="qwen3-0.6b-cpu">Qwen3 0.6B（CPU・GPUが使えない端末用）</option>
+            <optgroup label="CPU（どの端末でも確実に動く）">
+              <option value="qwen3.5-2b-cpu">Qwen3.5 2B・CPU（約1.3GB・おすすめ）</option>
+              <option value="gemma2-2b-jpn-cpu">Gemma 2 2B 日本語版・CPU（約1.7GB）</option>
+              <option value="qwen3.5-0.8b-cpu">Qwen3.5 0.8B・CPU（約0.5GB・軽量）</option>
+            </optgroup>
+            <optgroup label="GPU（速いが、端末によっては文字化けする）">
+              <option value="qwen3.5-2b">Qwen3.5 2B・GPU（約1.5GB）</option>
+              <option value="gemma2-2b-jpn">Gemma 2 2B 日本語版・GPU（約1.5GB）</option>
+              <option value="qwen3.5-4b">Qwen3.5 4B・GPU（約2.5GB・高品質）</option>
+              <option value="qwen3.5-0.8b">Qwen3.5 0.8B・GPU（約0.6GB）</option>
+            </optgroup>
           </select>
         </label>
         <label>GPU の計算精度
@@ -224,7 +230,19 @@ worker.onmessage = ({ data: m }) => {
         + (m.device === 'webgpu' ? 'GPU (WebGPU)' : 'CPU のみ（GPU 非対応）');
       $('recBtn').disabled = false; $('sumBtn').disabled = false;
       setStatus('準備完了');
-      if (m.device !== 'webgpu') $('llmModel').value = 'qwen3-0.6b-cpu';
+      {
+        // 要約モデルの初期値: GPU なし → CPU 版（GPU 版は動かない）。
+        // スマホ・タブレット → CPU 版（GPU は文字化けしやすい。前に GPU 版を選んでいても一度だけ切り替える）。
+        // PC → 未設定なら GPU 版（速い）。
+        let firstMobile = false, saved = null;
+        try {
+          saved = localStorage.getItem('opt-llmModel');
+          firstMobile = m.mobileGpu && localStorage.getItem('opt-cpu-default') !== '1';
+          if (m.mobileGpu) localStorage.setItem('opt-cpu-default', '1');
+        } catch { /* 無視 */ }
+        if (m.device !== 'webgpu' || firstMobile) $('llmModel').value = 'qwen3.5-2b-cpu';
+        else if (!m.mobileGpu && !saved) $('llmModel').value = 'qwen3.5-2b';
+      }
       runDiag(m.gpuDiag);
       break;
     case 'status': setStatus(m.text); break;

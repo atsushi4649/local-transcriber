@@ -1,7 +1,7 @@
 // 推論はすべてこのワーカー内（端末上）で実行する。音声・テキストは外部に送信しない。
-import {
-  pipeline, AutoTokenizer, AutoModelForCausalLM, TextStreamer, InterruptableStoppingCriteria, env,
-} from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
+
+const WLLAMA_VERSION = '3.8.1';
 
 env.allowLocalModels = false;
 env.useBrowserCache = true; // モデルは Cache Storage に保存され、2回目以降はオフラインで読み込まれる
@@ -10,14 +10,16 @@ const ASR_MODELS = {
   'base-ja': 'onnx-community/moonshine-base-ja-ONNX',
   // tiny-ja は decoder_model_merged が無く transformers.js 3.8.1 で読み込めないため除外
 };
-// 要約モデル。webllm: GPU 専用（WebLLM）、tjs: CPU でも動く（transformers.js）
-// {q} は計算精度（q4f16_1 / q4f32_1）に置き換える
+// 要約モデル。webllm: GPU（WebLLM、{q} は計算精度 q4f16_1 / q4f32_1 に置き換え）
+//            wllama: CPU（llama.cpp の WebAssembly 版。GPU が壊れる端末でも確実に動く）
 const LLM_MODELS = {
+  'qwen3.5-2b-cpu': { engine: 'wllama', repo: 'unsloth/Qwen3.5-2B-GGUF', file: 'Qwen3.5-2B-Q4_K_M.gguf' },
+  'gemma2-2b-jpn-cpu': { engine: 'wllama', repo: 'bartowski/gemma-2-2b-jpn-it-GGUF', file: 'gemma-2-2b-jpn-it-Q4_K_M.gguf', noSystem: true },
+  'qwen3.5-0.8b-cpu': { engine: 'wllama', repo: 'unsloth/Qwen3.5-0.8B-GGUF', file: 'Qwen3.5-0.8B-Q4_K_M.gguf' },
   'qwen3.5-2b': { engine: 'webllm', id: 'Qwen3.5-2B-{q}-MLC' },
   'gemma2-2b-jpn': { engine: 'webllm', id: 'gemma-2-2b-jpn-it-{q}-MLC', noSystem: true },
   'qwen3.5-4b': { engine: 'webllm', id: 'Qwen3.5-4B-{q}-MLC' },
   'qwen3.5-0.8b': { engine: 'webllm', id: 'Qwen3.5-0.8B-{q}-MLC' },
-  'qwen3-0.6b-cpu': { engine: 'tjs', id: 'onnx-community/Qwen3-0.6B-ONNX' },
 };
 
 let device = 'wasm';
@@ -87,15 +89,15 @@ function quant(precision) {
 }
 
 async function loadLlm(name, precision) {
-  const base = LLM_MODELS[name] || LLM_MODELS['qwen3.5-2b'];
-  const conf = { ...base, id: base.id.replace('{q}', quant(precision)) };
+  const base = LLM_MODELS[name] || LLM_MODELS['qwen3.5-2b-cpu'];
+  const conf = { ...base, id: base.id ? base.id.replace('{q}', quant(precision)) : base.file };
   if (llm && llmKey === conf.id) return llm;
   if (conf.engine === 'webllm' && device !== 'webgpu') {
-    throw new Error('この端末では GPU（WebGPU）が使えないため、このモデルは動きません。設定で「Qwen3 0.6B（CPU）」を選んでください。');
+    throw new Error('この端末では GPU（WebGPU）が使えないため、このモデルは動きません。設定で「CPU」のモデルを選んでください。');
   }
   await unloadLlm(); // 切り替え時は前のモデルを必ず解放する（メモリ不足エラー対策）
   post({ type: 'status', text: '要約モデルを読み込み中…（初回は1〜2GB 程度のダウンロード）' });
-  llm = conf.engine === 'webllm' ? await loadWebLlm(conf) : await loadTjsLlm(conf);
+  llm = conf.engine === 'webllm' ? await loadWebLlm(conf) : await loadWllama(conf);
   llmKey = conf.id;
   post({ type: 'llm-loaded', id: conf.id });
   return llm;
@@ -138,35 +140,47 @@ async function loadWebLlm(conf) {
   };
 }
 
-async function loadTjsLlm(conf) {
-  const tokenizer = await AutoTokenizer.from_pretrained(conf.id, { progress_callback: progress('llm') });
-  const model = await AutoModelForCausalLM.from_pretrained(conf.id, {
-    device: 'wasm', dtype: 'int8', progress_callback: progress('llm'),
+// CPU で要約する（wllama = llama.cpp の WebAssembly 版）。GPU は使わない。
+async function loadWllama(conf) {
+  const { Wllama, LoggerWithoutDebug } = await import(`https://cdn.jsdelivr.net/npm/@wllama/wllama@${WLLAMA_VERSION}/esm/index.js`);
+  const wllama = new Wllama(
+    { default: `https://cdn.jsdelivr.net/npm/@wllama/wllama@${WLLAMA_VERSION}/esm/wasm/wllama.wasm` },
+    { logger: LoggerWithoutDebug },
+  );
+  const cores = self.navigator.hardwareConcurrency || 4;
+  await wllama.loadModelFromHF({ repo: conf.repo, file: conf.file }, {
+    n_gpu_layers: 0, // GPU を使わない（モバイル GPU で出力が壊れるため）
+    n_ctx: 4096,
+    n_threads: Math.max(2, Math.min(6, cores - 2)),
+    progressCallback: ({ loaded, total }) => post({ type: 'llm-progress', progress: total ? loaded / total : 0 }),
   });
+  post({ type: 'llm-progress', progress: 1 });
   return {
     async chat(messages, onToken) {
-      const inputs = tokenizer.apply_chat_template(messages, {
-        add_generation_prompt: true, return_dict: true, enable_thinking: false,
-      });
-      const stopper = new InterruptableStoppingCriteria();
-      interrupt = () => stopper.interrupt();
+      if (conf.noSystem) messages = mergeSystem(messages);
+      const ac = new AbortController();
+      interrupt = () => ac.abort();
       let text = '';
-      const streamer = new TextStreamer(tokenizer, {
-        skip_prompt: true, skip_special_tokens: true,
-        callback_function: (t) => {
-          text += t;
-          if (looping(text)) stopper.interrupt(); else onToken?.(clean(text));
-        },
-      });
       try {
-        await model.generate({
-          ...inputs, max_new_tokens: 700, do_sample: false, repetition_penalty: 1.15,
-          streamer, stopping_criteria: stopper,
+        const stream = await wllama.createChatCompletion({
+          messages, stream: true, abortSignal: ac.signal, max_tokens: 700,
+          temp: 0.3, top_p: 0.9, penalty_repeat: 1.1, penalty_freq: 0.3,
+          chat_template_kwargs: { enable_thinking: false },
         });
+        for await (const chunk of stream) {
+          const t = chunk.choices?.[0]?.delta?.content || '';
+          if (!t) continue;
+          text += t;
+          if (looping(text)) { ac.abort(); break; }
+          if (garbled(text)) { ac.abort(); throw new Error(GARBLED_MSG); }
+          onToken?.(clean(text));
+        }
+      } catch (e) {
+        if (!ac.signal.aborted) throw e; // 停止ボタン・繰り返し検知による中断はエラーにしない
       } finally { interrupt = null; }
       return clean(text);
     },
-    async unload() { await model.dispose(); },
+    async unload() { await wllama.exit(); },
   };
 }
 
