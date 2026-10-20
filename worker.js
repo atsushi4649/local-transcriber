@@ -116,10 +116,10 @@ async function loadWebLlm(conf) {
   post({ type: 'llm-progress', progress: 1 });
   const engine = webllmEngine;
   return {
-    async chat(messages, onToken) {
+    async chat(messages, onToken, maxTokens = 700) {
       if (conf.noSystem) messages = mergeSystem(messages);
       const stream = await engine.chat.completions.create({
-        messages, stream: true, temperature: 0.3, top_p: 0.9, max_tokens: 700,
+        messages, stream: true, temperature: 0.3, top_p: 0.9, max_tokens: maxTokens,
         repetition_penalty: 1.1, frequency_penalty: 0.4, extra_body: { enable_thinking: false },
       });
       let text = '';
@@ -156,14 +156,14 @@ async function loadWllama(conf) {
   });
   post({ type: 'llm-progress', progress: 1 });
   return {
-    async chat(messages, onToken) {
+    async chat(messages, onToken, maxTokens = 700) {
       if (conf.noSystem) messages = mergeSystem(messages);
       const ac = new AbortController();
       interrupt = () => ac.abort();
       let text = '';
       try {
         const stream = await wllama.createChatCompletion({
-          messages, stream: true, abortSignal: ac.signal, max_tokens: 700,
+          messages, stream: true, abortSignal: ac.signal, max_tokens: maxTokens,
           temp: 0.3, top_p: 0.9, penalty_repeat: 1.1, penalty_freq: 0.3,
           chat_template_kwargs: { enable_thinking: false },
         });
@@ -261,11 +261,15 @@ function cleanup(t) {
   return t.replace(/(.{2,20}?)\1{3,}/g, '$1');
 }
 
-async function generate(m, messages, onToken) {
-  return (await m.chat(messages, onToken)).trim();
+async function generate(m, messages, onToken, maxTokens) {
+  return (await m.chat(messages, onToken, maxTokens)).trim();
 }
 
-const SYS = 'あなたは日本語の文字起こしを要約するアシスタントです。文字起こしには誤認識が含まれることがあるので、文脈から自然に補って理解してください。事実を付け加えず、内容に忠実に、簡潔な日本語で書いてください。これからの予定を過去のこととして書かないでください。';
+const SYS = 'あなたは日本語の文字起こしを要約するアシスタントです。文字起こしに書かれている内容だけを使い、簡潔な日本語で書いてください。誤認識と思われる語は無理に解釈しないでください。これからの予定を過去のこととして書かないでください。';
+// 小さいモデルは最後の指示に従いやすいので、作り話の禁止を末尾にも置く
+const NO_FABRICATION = '\n\n重要: 文字起こしに出てこない話題・人物・数字・理由・背景は絶対に書かないでください。内容が少なければ、そのぶん短く書いてください。';
+const MIN_CHARS = 80;   // これ未満は要約しない（作り話の元になる）
+const SHORT_CHARS = 150; // これ未満は概要だけの短い要約にする
 
 function splitText(text, size = 2200) {
   const parts = [];
@@ -280,10 +284,20 @@ function splitText(text, size = 2200) {
 
 async function summarize({ text, llmModel, precision, style }) {
   stopRequested = false;
+  const chars = text.replace(/\s/g, '').length;
+  if (chars < MIN_CHARS) {
+    post({ type: 'summary-reset' });
+    post({ type: 'summary-done', text: `（文字起こしが短い（${chars}文字）ため、要約はしません。${MIN_CHARS}文字以上になると要約できます）` });
+    return;
+  }
   const m = await loadLlm(llmModel, precision);
-  const format = style === 'minutes'
-    ? '議事録としてまとめてください。見出し「## 概要」の下に全体を2〜3文の文章で、見出し「## 要点」の下に重要な内容を箇条書きで、見出し「## 決定事項・TODO」の下に、決まったことや誰が何をいつまでにするかを箇条書きで書いてください。各見出しは1回だけ使い、最後まで書いたら終えてください。'
-    : '要約してください。見出し「## 概要」の下に全体を2〜3文の文章で、見出し「## 要点」の下に重要な内容を3〜7個の箇条書きで書いてください。各見出しは1回だけ使い、最後まで書いたら終えてください。';
+  // 出力の長さを入力の長さに比例させる（短い入力に長い出力を許すと作り話で埋めてしまう）
+  const maxTokens = chars < SHORT_CHARS ? 150 : Math.min(700, chars + 200);
+  const format = chars < SHORT_CHARS
+    ? '短く要約してください。見出し「## 概要」の下に、話された内容を1〜2文で書くだけにしてください。'
+    : style === 'minutes'
+      ? '議事録としてまとめてください。見出し「## 概要」の下に全体を短い文章で、見出し「## 要点」の下に重要な内容を箇条書きで、見出し「## 決定事項・TODO」の下に、決まったことや誰が何をいつまでにするかを箇条書きで書いてください（話されていなければ「なし」）。各見出しは1回だけ使い、最後まで書いたら終えてください。'
+      : '要約してください。見出し「## 概要」の下に全体を短い文章で、見出し「## 要点」の下に重要な内容を箇条書きで書いてください。箇条書きの数は内容の量に合わせ、無理に増やさないでください。各見出しは1回だけ使い、最後まで書いたら終えてください。';
 
   let source = text;
   const parts = splitText(text);
@@ -294,8 +308,8 @@ async function summarize({ text, llmModel, precision, style }) {
       post({ type: 'status', text: `長文のため分割して処理中… (${i + 1}/${parts.length})` });
       const n = await generate(m, [
         { role: 'system', content: SYS },
-        { role: 'user', content: `【文字起こしの一部】\n${parts[i]}\n\n上の内容の重要な点を、箇条書きで5個以内にまとめてください。` },
-      ]);
+        { role: 'user', content: `【文字起こしの一部】\n${parts[i]}\n\n上の内容の重要な点を、箇条書きで5個以内にまとめてください。${NO_FABRICATION}` },
+      ], null, 400);
       notes.push(n);
     }
     source = notes.join('\n');
@@ -305,8 +319,8 @@ async function summarize({ text, llmModel, precision, style }) {
   post({ type: 'summary-reset' });
   const final = await generate(m, [
     { role: 'system', content: SYS },
-    { role: 'user', content: `【${parts.length > 1 ? '長い文字起こしから抽出したメモ' : '文字起こし'}】\n${source}\n\n上の内容を${format}` },
-  ], (t) => post({ type: 'summary-token', text: t }));
+    { role: 'user', content: `【${parts.length > 1 ? '長い文字起こしから抽出したメモ' : '文字起こし'}】\n${source}\n\n上の内容を${format}${NO_FABRICATION}` },
+  ], (t) => post({ type: 'summary-token', text: t }), maxTokens);
   post({ type: 'summary-done', text: final, stopped: stopRequested });
 }
 
