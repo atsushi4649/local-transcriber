@@ -11,16 +11,18 @@ const ASR_MODELS = {
   // tiny-ja は decoder_model_merged が無く transformers.js 3.8.1 で読み込めないため除外
 };
 // 要約モデル。webllm: GPU 専用（WebLLM）、tjs: CPU でも動く（transformers.js）
+// {q} は計算精度（q4f16_1 / q4f32_1）に置き換える
 const LLM_MODELS = {
-  'qwen3.5-2b': { engine: 'webllm', id: 'Qwen3.5-2B-q4f16_1-MLC' },
-  'gemma2-2b-jpn': { engine: 'webllm', id: 'gemma-2-2b-jpn-it-q4f16_1-MLC', noSystem: true },
-  'qwen3.5-4b': { engine: 'webllm', id: 'Qwen3.5-4B-q4f16_1-MLC' },
-  'qwen3.5-0.8b': { engine: 'webllm', id: 'Qwen3.5-0.8B-q4f16_1-MLC' },
+  'qwen3.5-2b': { engine: 'webllm', id: 'Qwen3.5-2B-{q}-MLC' },
+  'gemma2-2b-jpn': { engine: 'webllm', id: 'gemma-2-2b-jpn-it-{q}-MLC', noSystem: true },
+  'qwen3.5-4b': { engine: 'webllm', id: 'Qwen3.5-4B-{q}-MLC' },
+  'qwen3.5-0.8b': { engine: 'webllm', id: 'Qwen3.5-0.8B-{q}-MLC' },
   'qwen3-0.6b-cpu': { engine: 'tjs', id: 'onnx-community/Qwen3-0.6B-ONNX' },
 };
 
 let device = 'wasm';
 let f16 = false;
+let mobileGpu = false; // Qualcomm / ARM などのモバイル GPU（半精度で出力が壊れやすい）
 let asr = null, asrKey = null;
 let llm = null, llmKey = null;
 
@@ -36,10 +38,12 @@ async function detectDevice() {
         device = 'webgpu'; f16 = adapter.features.has('shader-f16');
         const i = adapter.info || {};
         gpuDiag = `OK: ${i.vendor || '?'} ${i.architecture || ''} ${i.description || ''}`.trim();
+        mobileGpu = /qualcomm|adreno|arm|mali|imagination|powervr|samsung/i.test(`${i.vendor} ${i.architecture} ${i.description}`)
+          || /Android/i.test(navigator.userAgent);
       }
     }
   } catch (e) { gpuDiag = 'エラー: ' + (e?.message || e); }
-  return { device, f16, gpuDiag };
+  return { device, f16, mobileGpu, gpuDiag };
 }
 
 function progress(kind) {
@@ -76,16 +80,24 @@ async function unloadLlm() {
   llm = null; llmKey = null;
 }
 
-async function loadLlm(name) {
-  if (llm && llmKey === name) return llm;
-  const conf = LLM_MODELS[name] || LLM_MODELS['qwen3.5-2b'];
+// precision: 'auto' | 'f32' | 'f16'。自動ではモバイル GPU や f16 非対応 GPU で f32 を使う
+function quant(precision) {
+  const useF32 = precision === 'f32' || (precision !== 'f16' && (mobileGpu || !f16));
+  return useF32 ? 'q4f32_1' : 'q4f16_1';
+}
+
+async function loadLlm(name, precision) {
+  const base = LLM_MODELS[name] || LLM_MODELS['qwen3.5-2b'];
+  const conf = { ...base, id: base.id.replace('{q}', quant(precision)) };
+  if (llm && llmKey === conf.id) return llm;
   if (conf.engine === 'webllm' && device !== 'webgpu') {
     throw new Error('この端末では GPU（WebGPU）が使えないため、このモデルは動きません。設定で「Qwen3 0.6B（CPU）」を選んでください。');
   }
   await unloadLlm(); // 切り替え時は前のモデルを必ず解放する（メモリ不足エラー対策）
   post({ type: 'status', text: '要約モデルを読み込み中…（初回は1〜2GB 程度のダウンロード）' });
   llm = conf.engine === 'webllm' ? await loadWebLlm(conf) : await loadTjsLlm(conf);
-  llmKey = name;
+  llmKey = conf.id;
+  post({ type: 'llm-loaded', id: conf.id });
   return llm;
 }
 
@@ -116,6 +128,7 @@ async function loadWebLlm(conf) {
           if (!t) continue;
           text += t;
           if (looping(text)) { engine.interruptGenerate(); break; }
+          if (garbled(text)) { engine.interruptGenerate(); throw new Error(GARBLED_MSG); }
           onToken?.(clean(text));
         }
       } finally { interrupt = null; }
@@ -171,6 +184,22 @@ function stripThink(t) {
 
 // 生成中の現在のモデルを止める関数（停止ボタン・繰り返し検知用）
 let interrupt = null;
+
+// GPU の計算が壊れると、無関係な文字体系（アラビア文字・ベンガル文字・タイ文字・キリル文字・
+// ハングルなど）や中国語・英単語の羅列になり、ひらがながほぼ出なくなる。
+// 60 文字以上出た時点で、そのどちらかに当てはまれば文字化けとみなす。
+const GARBLED_MSG = '出力が文字化けしています（GPU の計算が正しく行われていません）。'
+  + '設定の「GPU の計算精度」を「f32（互換）」にして、もう一度要約してください。';
+function garbled(text) {
+  const t = text.replace(/\s/g, '');
+  if (t.length < 60) return false;
+  const count = (re) => t.match(re)?.length || 0;
+  const foreign = count(/[Ѐ-ӿ֐-ۿऀ-෿฀-๿가-힯]/g);
+  const hiragana = count(/[ぁ-ゟ]/g);
+  const latin = count(/[A-Za-z]/g);
+  // 箇条書きだけの要約はひらがなが少ないことがあるので、英字だらけの場合に限って判定する
+  return foreign / t.length > 0.1 || (hiragana / t.length < 0.05 && latin / t.length > 0.25);
+}
 
 // 小さいモデルが同じ行や同じフレーズを繰り返し始めたら true
 function looping(text) {
@@ -235,9 +264,9 @@ function splitText(text, size = 2200) {
   return parts;
 }
 
-async function summarize({ text, llmModel, style }) {
+async function summarize({ text, llmModel, precision, style }) {
   stopRequested = false;
-  const m = await loadLlm(llmModel);
+  const m = await loadLlm(llmModel, precision);
   const format = style === 'minutes'
     ? '議事録としてまとめてください。見出し「## 概要」の下に全体を2〜3文の文章で、見出し「## 要点」の下に重要な内容を箇条書きで、見出し「## 決定事項・TODO」の下に、決まったことや誰が何をいつまでにするかを箇条書きで書いてください。各見出しは1回だけ使い、最後まで書いたら終えてください。'
     : '要約してください。見出し「## 概要」の下に全体を2〜3文の文章で、見出し「## 要点」の下に重要な内容を3〜7個の箇条書きで書いてください。各見出しは1回だけ使い、最後まで書いたら終えてください。';
@@ -280,7 +309,7 @@ self.onmessage = (e) => {
       else if (msg.type === 'summarize') await summarize(msg);
       else if (msg.type === 'preload') {
         await loadAsr(msg.asrModel);
-        await loadLlm(msg.llmModel);
+        await loadLlm(msg.llmModel, msg.precision);
         post({ type: 'preloaded' });
       }
       post({ type: 'idle', for: msg.type, id: msg.id });

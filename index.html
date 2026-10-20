@@ -118,8 +118,16 @@
             <option value="qwen3-0.6b-cpu">Qwen3 0.6B（CPU・GPUが使えない端末用）</option>
           </select>
         </label>
+        <label>GPU の計算精度
+          <select id="precision">
+            <option value="auto">自動（スマホ・タブレットは f32）</option>
+            <option value="f32">f32（互換・文字化けする場合）</option>
+            <option value="f16">f16（速い・PC 向け）</option>
+          </select>
+        </label>
         <button id="preload">選んだモデルを今すぐダウンロード</button>
       </div>
+      <p class="small" id="llmInfo"></p>
       <p class="small" id="storage"></p>
       <details style="margin-top:8px">
         <summary>診断情報（GPU が使えないとき）</summary>
@@ -235,6 +243,7 @@ worker.onmessage = ({ data: m }) => {
       setSummarizing(false);
       setStatus(m.stopped ? '要約を停止しました' : '要約完了'); saveHistory(); break;
     case 'preloaded': setStatus('モデルの準備完了。以降はオフラインで使えます。'); storageInfo(); break;
+    case 'llm-loaded': $('llmInfo').textContent = '読み込み済みの要約モデル: ' + m.id; break;
     case 'idle':
       if (m.for === 'transcribe') {
         pending--;
@@ -391,10 +400,10 @@ $('sumBtn').onclick = () => {
   const text = $('transcript').value.trim();
   if (!text) { setStatus('先に文字起こしをしてください', true); return; }
   setSummarizing(true);
-  worker.postMessage({ type: 'summarize', text, llmModel: $('llmModel').value, style: $('style').value });
+  worker.postMessage({ type: 'summarize', text, llmModel: $('llmModel').value, precision: $('precision').value, style: $('style').value });
 };
 $('preload').onclick = () => {
-  worker.postMessage({ type: 'preload', asrModel: $('asrModel').value, llmModel: $('llmModel').value });
+  worker.postMessage({ type: 'preload', asrModel: $('asrModel').value, llmModel: $('llmModel').value, precision: $('precision').value });
 };
 
 // ---------- コピー・保存 ----------
@@ -441,7 +450,7 @@ function renderHist() {
 renderHist();
 
 // 設定を記憶（この端末のみ）
-for (const id of ['asrModel', 'llmModel', 'style']) {
+for (const id of ['asrModel', 'llmModel', 'precision', 'style']) {
   try { const v = localStorage.getItem('opt-' + id); if (v && [...$(id).options].some((o) => o.value === v)) $(id).value = v; } catch { /* 無視 */ }
   $(id).addEventListener('change', () => { try { localStorage.setItem('opt-' + id, $(id).value); } catch { /* 無視 */ } });
 }
